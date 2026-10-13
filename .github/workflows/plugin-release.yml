@@ -1,0 +1,174 @@
+# The only way a DemLeagueOS plugin gets published. Each module lives in its own repository in the unifyamerica
+# org, named like its package (`unifyamerica/demleague-plugin-<vendor>-<module>` for
+# `@unifyamerica/demleague-plugin-<vendor>-<module>`), and calls this workflow on a version tag:
+#
+#   name: Release
+#   on:
+#     push:
+#       tags: ['v*']
+#   permissions:
+#     contents: read
+#     packages: write
+#     id-token: write
+#     attestations: write
+#   jobs:
+#     release:
+#       uses: unifyamerica/demleague-plugin-workflows/.github/workflows/plugin-release.yml@main
+#
+# 1. build: the template's checks (lint, type-check, tests), the build and `npm pack`. It runs the module's
+#    own code, so it only gets read access.
+# 2. publish: runs none of the module's code. It checks the tarball's name and version against the repository
+#    and tag, attests it (SLSA build provenance, signed through GitHub) and publishes it to GitHub Packages.
+#
+# DemLeagueOS's Plugin contract check only accepts a package attested by this workflow, from main, for a
+# `v<version>` tag of the repository named like the package. Changes to it go through a reviewed PR.
+name: Release a DemLeagueOS plugin
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    name: Check, build and pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+    steps:
+      - name: Release from a version tag only
+        if: github.ref_type != 'tag' || !startsWith(github.ref_name, 'v')
+        run: |
+          echo "::error::Run this from a v<version> tag, not ${GITHUB_REF}"
+          exit 1
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@unifyamerica"
+      - name: Package matches the repository and the tag
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          node - <<'EOF'
+          const pkg = require(`${process.cwd()}/package.json`);
+          const [owner, repo] = process.env.REPOSITORY.split('/');
+          const problems = [];
+          if (!/^demleague-plugin-[a-z0-9]+(?:-[a-z0-9]+)+$/.test(repo))
+            problems.push(`the repository must be named demleague-plugin-<vendor>-<module>, not ${repo}`);
+          if (pkg.name !== `@${owner}/${repo}`)
+            problems.push(`package.json "name" must be @${owner}/${repo}, not ${pkg.name}`);
+          if (process.env.TAG !== `v${pkg.version}`)
+            problems.push(`tag ${process.env.TAG} doesn't match package.json "version" ${pkg.version}`);
+          // GitHub links the package to the repository it names
+          const repositoryUrl = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url;
+          if (!new RegExp(`github\\.com[/:]${owner}/${repo}(\\.git)?$`).test(repositoryUrl ?? '') || pkg.repository?.directory)
+            problems.push(`package.json "repository" must be https://github.com/${owner}/${repo} (no "directory")`);
+          if (pkg.publishConfig?.registry !== 'https://npm.pkg.github.com')
+            problems.push('publishConfig.registry must be https://npm.pkg.github.com');
+          if (!pkg.peerDependencies?.['@unifyamerica/demleague-plugin-sdk'])
+            problems.push('@unifyamerica/demleague-plugin-sdk must be a peerDependency');
+          for (const script of ['lint', 'type-check', 'test', 'build'])
+            if (!pkg.scripts?.[script]) problems.push(`package.json needs a "${script}" script`);
+          problems.forEach((problem) => console.log(`::error::${problem}`));
+          process.exit(problems.length ? 1 : 0);
+          EOF
+      - name: Install
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+      - run: npm run lint
+      - run: npm run type-check
+      - run: npm test
+      - run: npm run build
+      - name: The manifest's version is the package's
+        run: |
+          node - <<'EOF'
+          require('reflect-metadata');
+          const pkg = require(`${process.cwd()}/package.json`);
+          const manifest = Object.values(require(process.cwd())).find(
+            (value) => value && typeof value === 'object' && 'sdkApiVersion' in value,
+          );
+          if (!manifest) {
+            console.log('::error::The entry point must export the manifest');
+            process.exit(1);
+          }
+          if (manifest.version !== pkg.version) {
+            console.log(`::error::manifest.version ${manifest.version} must equal package.json "version" ${pkg.version}`);
+            process.exit(1);
+          }
+          EOF
+      - name: Pack
+        id: pack
+        run: |
+          tarball=$(npm pack --json | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename)')
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attest and publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@unifyamerica"
+      # The build job ran the module's code: check what it packed before signing it
+      - name: Tarball matches the repository and the tag
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          tar -xOzf "$TARBALL" package/package.json > tarball-package.json
+          node - <<'EOF'
+          const pkg = require(`${process.cwd()}/tarball-package.json`);
+          const [owner, repo] = process.env.REPOSITORY.split('/');
+          const repositoryUrl = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url;
+          const linked = new RegExp(`github\\.com[/:]${owner}/${repo}(\\.git)?$`).test(repositoryUrl ?? '');
+          if (pkg.name !== `@${owner}/${repo}` || process.env.TAG !== `v${pkg.version}` || !linked) {
+            console.log(`::error::The packed ${pkg.name}@${pkg.version} doesn't match ${process.env.REPOSITORY} ${process.env.TAG}`);
+            process.exit(1);
+          }
+          EOF
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ needs.build.outputs.tarball }}
+      - name: Publish to GitHub Packages
+        run: npm publish "./${{ needs.build.outputs.tarball }}" --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+      - name: Summary
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          ATTESTATION: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          {
+            echo "### Published ${TARBALL%.tgz}"
+            echo ""
+            echo "- sha256: \`$(sha256sum "$TARBALL" | cut -d' ' -f1)\`"
+            echo "- Attestation: ${ATTESTATION}"
+            echo ""
+            echo "Ask the core team to install it: they open the install PR on DemLeagueOS."
+          } >> "$GITHUB_STEP_SUMMARY"
