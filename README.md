@@ -35,8 +35,11 @@ The workflow runs in two jobs:
 Because the plugin's scripts never run in the job that holds the signing identity, a plugin can't get any
 other file attested as this workflow's build.
 
-The example plugin, [demleague-plugin-acme-notes](https://github.com/unifyamerica/demleague-plugin-acme-notes),
-uses it and is the template for new plugins. The SDK is
+The example plugins use it: [demleague-plugin-acme-notes](https://github.com/unifyamerica/demleague-plugin-acme-notes),
+the template for new plugins, and
+[demleague-plugin-acme-tasks](https://github.com/unifyamerica/demleague-plugin-acme-tasks), which shows one module
+calling another's exported operations. The workflow treats them alike: calls between modules are approved in
+DemLeagueOS' namespace registry, not at release time. The SDK is
 [demleague-plugin-sdk](https://github.com/unifyamerica/demleague-plugin-sdk).
 
 Attestations need the plugin repository to be public on the organization's current GitHub plan.
