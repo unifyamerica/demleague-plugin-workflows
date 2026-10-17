@@ -92,7 +92,7 @@ jobs:
           require('reflect-metadata');
           const pkg = require(`${process.cwd()}/package.json`);
           const manifest = Object.values(require(process.cwd())).find(
-            (value) => value && typeof value === 'object' && 'sdkApiVersion' in value,
+            (value) => value && typeof value === 'object' && 'namespace' in value && 'displayName' in value && 'endpoints' in value,
           );
           if (!manifest) {
             console.log('::error::The entry point must export the manifest');
